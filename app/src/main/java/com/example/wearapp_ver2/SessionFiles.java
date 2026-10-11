@@ -414,7 +414,7 @@ final class SessionFiles {
         try {
             descriptor = Os.open(
                     directory.getAbsolutePath(),
-                    OsConstants.O_RDONLY | OsConstants.O_DIRECTORY,
+                    OsConstants.O_RDONLY,
                     0
             );
 
