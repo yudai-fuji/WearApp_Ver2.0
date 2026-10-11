@@ -1,8 +1,17 @@
 <resources>
     <string name="app_name">WearApp_ver2.0</string>
     <string name="stopwatch_initial">00:00:000</string>
+    <string name="stopwatch_unknown">--:--:---</string>
+
     <string name="button_start">START</string>
     <string name="button_stop">STOP</string>
     <string name="button_save">SAVE</string>
     <string name="button_reset">RESET</string>
+
+    <string name="service_connecting">接続待ち</string>
+    <string name="measurement_channel">歩行実験の計測</string>
+    <string name="measurement_running">センサデータを記録しています</string>
+    <string name="measurement_start_failed">計時を開始できませんでした</string>
+    <string name="measurement_connection_failed">計測サービスに接続できませんでした</string>
+    <string name="measurement_connection_lost">計測サービスとの接続が失われました</string>
 </resources>
