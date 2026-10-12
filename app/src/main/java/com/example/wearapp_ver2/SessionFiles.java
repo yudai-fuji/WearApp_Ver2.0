@@ -3,6 +3,7 @@ package com.example.wearapp_ver2;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
+import android.system.StructStat;
 import android.util.Log;
 
 import java.io.DataInputStream;
@@ -15,11 +16,16 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.Channels;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.regex.Pattern;
 
 final class SessionFiles {
 
@@ -27,7 +33,34 @@ final class SessionFiles {
 
     private static final String TAG = "SessionFiles";
 
+    private static final int SAVE_INTENT_MAGIC = 0x57535631; // WSV1
     private final File root;
+    private final CsvMover csvMover;
+
+    interface CsvMover {
+        void move(File source, File destination) throws IOException;
+    }
+
+    private static final class SaveIntent {
+        final File destination;
+        final long device;
+        final long inode;
+        final long size;
+        final long startNs;
+        final long stopNs;
+        final boolean complete;
+
+        SaveIntent(File destination, long device, long inode, long size,
+                   long startNs, long stopNs, boolean complete) {
+            this.destination = destination;
+            this.device = device;
+            this.inode = inode;
+            this.size = size;
+            this.startNs = startNs;
+            this.stopNs = stopNs;
+            this.complete = complete;
+        }
+    }
 
     static final class Session {
         final File temp;
@@ -50,6 +83,16 @@ final class SessionFiles {
     }
 
     SessionFiles(File filesDir) throws IOException {
+        this(filesDir, (source, destination) -> {
+            // ATOMIC_MOVE は既存の移動先を置換し得るため、CSVには指定しない。
+            // 呼び出しは既存の FILE_IO スレッドで直列化される。
+            Files.move(source.toPath(), destination.toPath());
+        });
+    }
+
+    // 保存失敗を再現するテスト用に、CSVの移動だけを差し替え可能にする。
+    SessionFiles(File filesDir, CsvMover csvMover) throws IOException {
+        this.csvMover = csvMover;
         root = new File(filesDir, "measurements");
 
         if (!root.isDirectory() && !root.mkdirs()) {
@@ -71,6 +114,8 @@ final class SessionFiles {
             if (temp.exists()
                     || new File(temp.getPath() + ".ok").exists()
                     || new File(temp.getPath() + ".ok.new").exists()
+                    || exists(new File(temp.getPath() + ".save"))
+                    || exists(new File(temp.getPath() + ".save.new"))
                     || hasCsvName(name)) {
                 continue;
             }
@@ -89,6 +134,17 @@ final class SessionFiles {
     }
 
     Session recover() throws IOException {
+        // リネーム後は .tmp がないため、保存管理ファイルから先に復旧する。
+        for (File intentFile : listFiles(".tmp.save")) {
+            String tempName = intentFile.getName();
+            tempName = tempName.substring(0, tempName.length() - ".save".length());
+            Session moved = new Session(new File(root, tempName),
+                    tempName.substring(0, tempName.length() - ".tmp".length()), 0L);
+            if (!exists(moved.temp)) {
+                finishSave(moved, readSaveIntent(moved));
+            }
+        }
+
         File[] pending = listFiles(".tmp");
 
         Arrays.sort(
@@ -118,31 +174,11 @@ final class SessionFiles {
                 continue;
             }
 
-            try (RandomAccessFile input = new RandomAccessFile(temp, "r")) {
-                if (!HEADER.equals(readLine(input, 64))) {
-                    throw new IOException("CSV ヘッダーが不正です");
-                }
-
-                String[] start = readLine(input, 128).split(",", -1);
-
-                if (start.length != 6
-                        || !"START".equals(start[1])
-                        || !start[2].isEmpty()
-                        || !start[3].isEmpty()
-                        || !start[4].isEmpty()
-                        || !start[5].isEmpty()) {
-                    throw new IOException("START 行が不正です");
-                }
-
-                session.startNs = Long.parseLong(start[0]);
-
-                if (session.startNs < 0L) {
-                    throw new IOException("開始時刻が不正です");
-                }
-
+            try {
+                session.startNs = readStartTimestamp(temp);
                 session.validHeader = true;
 
-            } catch (IOException | NumberFormatException exception) {
+            } catch (IOException exception) {
                 session.problem = "一時ファイルを復旧できません";
                 Log.e(TAG, session.problem, exception);
                 return session;
@@ -159,10 +195,11 @@ final class SessionFiles {
                          new DataInputStream(new FileInputStream(marker))) {
 
                 long stopNs = input.readLong();
+                long csvStopNs = readStopTimestamp(temp);
 
                 if (input.read() != -1
                         || stopNs < session.startNs
-                        || !endsWithNewline(temp)) {
+                        || (csvStopNs >= 0L && csvStopNs != stopNs)) {
                     throw new IOException("正常終了情報が不正です");
                 }
 
@@ -210,56 +247,199 @@ final class SessionFiles {
             return;
         }
 
-        // リンク作成後の tmp は CSV と同じ実体なので、先に確認する。
-        File destination = findLinkedCsv(session);
-
-        if (destination == null) {
+        SaveIntent intent = null;
+        if (exists(saveIntentFile(session))) {
+            // 失敗後の再試行では、CSV化済みかどうかを先に確認する。
+            try {
+                intent = readSaveIntent(session);
+            } catch (IOException exception) {
+                if (!exists(session.temp)) {
+                    throw exception; // 元データがなければ移動先を推測しない。
+                }
+                Log.w(TAG, "保存管理情報を元データから作り直します", exception);
+            }
+        }
+        if (intent == null) {
+            File linked = findLinkedCsv(session); // 旧版のハードリンク方式との互換
+            if (linked != null) {
+                syncFile(linked);
+                syncDirectory(root);
+                session.saved = true;
+                cleanup(session);
+                Log.i(TAG, "Saved legacy CSV: " + linked.getAbsolutePath());
+                return;
+            }
             if (!session.validHeader) {
                 throw new IOException("有効な START 行がありません");
             }
-
             if (!session.complete) {
                 trimIncompleteTail(session.temp);
             }
-
             syncFile(session.temp);
-
-            String base = session.stem
-                    + (session.complete ? "" : "_incomplete");
-
-            for (int index = 0; index < Integer.MAX_VALUE; index++) {
-                String suffix = index == 0 ? "" : "_" + index;
-                File candidate = new File(root, base + suffix + ".csv");
-
-                try {
-                    Files.createLink(
-                            candidate.toPath(),
-                            session.temp.toPath()
-                    );
-
-                    destination = candidate;
-                    break;
-
-                } catch (FileAlreadyExistsException exception) {
-                    // 既存 CSV を上書きせず、別の名前を試す。
-                }
+            if (readStartTimestamp(session.temp) != session.startNs) {
+                throw new IOException("保存対象の START 時刻が一致しません");
             }
-
-            if (destination == null) {
-                throw new IOException("空いている保存名がありません");
-            }
-
-        } else {
-            syncFile(destination);
+            StructStat stat = statRegularFile(session.temp);
+            intent = new SaveIntent(nextDestination(session), stat.st_dev,
+                    stat.st_ino, stat.st_size, session.startNs,
+                    session.stopNs, session.complete);
+            writeSaveIntent(session, intent);
         }
 
-        syncDirectory(root);
+        for (;;) {
+            if (!exists(session.temp)) {
+                // move 済み・ディレクトリ同期未完了の再試行。
+                finishSave(session, intent);
+                return;
+            }
+            verifyIdentity(session.temp, intent);
+            if (Files.isRegularFile(intent.destination.toPath(), LinkOption.NOFOLLOW_LINKS)
+                    && Files.isSameFile(session.temp.toPath(), intent.destination.toPath())) {
+                finishSave(session, intent);
+                return;
+            }
+            if (!exists(intent.destination)) {
+                // 管理ファイル作成時の同期が失敗していた場合も、移動前に確定する。
+                syncFile(saveIntentFile(session));
+                syncDirectory(root);
+                try {
+                    csvMover.move(session.temp, intent.destination);
+                    finishSave(session, intent);
+                    return;
+                } catch (FileAlreadyExistsException exception) {
+                    // 確認後に同名が現れた場合も、既存CSVは変更しない。
+                    if (!exists(session.temp)) {
+                        throw exception;
+                    }
+                }
+            }
+            // 名前衝突時だけ別名にする。アクセス拒否等で別方式へ逃げない。
+            intent = new SaveIntent(nextDestination(session), intent.device,
+                    intent.inode, intent.size, intent.startNs,
+                    intent.stopNs, intent.complete);
+            writeSaveIntent(session, intent);
+        }
+    }
 
+    private File nextDestination(Session session) throws IOException {
+        String base = session.stem + (session.complete ? "" : "_incomplete");
+        for (int index = 0; index < Integer.MAX_VALUE; index++) {
+            File candidate = new File(root, base
+                    + (index == 0 ? "" : "_" + index) + ".csv");
+            if (!exists(candidate)) {
+                return candidate;
+            }
+        }
+        throw new IOException("空いている保存名がありません");
+    }
+
+    private File saveIntentFile(Session session) {
+        return new File(session.temp.getPath() + ".save");
+    }
+
+    private void writeSaveIntent(Session session, SaveIntent intent) throws IOException {
+        File journal = saveIntentFile(session);
+        File staging = new File(journal.getPath() + ".new");
+        // 前回の書きかけを除去し、新規作成する。既存リンク先を切り詰めない。
+        Files.deleteIfExists(staging.toPath());
+        try (FileChannel channel = FileChannel.open(staging.toPath(),
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+             DataOutputStream output = new DataOutputStream(Channels.newOutputStream(channel))) {
+            output.writeInt(SAVE_INTENT_MAGIC);
+            output.writeUTF(intent.destination.getName());
+            output.writeLong(intent.device);
+            output.writeLong(intent.inode);
+            output.writeLong(intent.size);
+            output.writeLong(intent.startNs);
+            output.writeLong(intent.stopNs);
+            output.writeBoolean(intent.complete);
+            output.flush();
+            channel.force(true);
+        }
+        // 置換するのは小さな保存管理ファイルだけ。CSVにはREPLACE_EXISTINGを使わない。
+        Files.move(staging.toPath(), journal.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        // CSV移動直前に save() が管理ファイルとディレクトリを同期する。
+    }
+
+    private SaveIntent readSaveIntent(Session session) throws IOException {
+        File journal = saveIntentFile(session);
+        if (Files.size(journal.toPath()) > 512L) {
+            throw new IOException("保存管理ファイルが不正です");
+        }
+        try (DataInputStream input = new DataInputStream(new FileInputStream(journal))) {
+            if (input.readInt() != SAVE_INTENT_MAGIC) {
+                throw new IOException("保存管理ファイルの形式が不正です");
+            }
+            String name = input.readUTF();
+            if (!name.matches(Pattern.quote(session.stem) + "(?:_incomplete)?(?:_[0-9]+)?\\.csv")) {
+                throw new IOException("保存先ファイル名が不正です");
+            }
+            SaveIntent intent = new SaveIntent(new File(root, name),
+                    input.readLong(), input.readLong(), input.readLong(),
+                    input.readLong(), input.readLong(), input.readBoolean());
+            if (input.read() != -1 || intent.size < 0L || intent.startNs < 0L
+                    || (intent.complete && intent.stopNs < intent.startNs)) {
+                throw new IOException("保存管理情報が不正です");
+            }
+            return intent;
+        }
+    }
+
+    private void finishSave(Session session, SaveIntent intent) throws IOException {
+        verifyIdentity(intent.destination, intent);
+        if (exists(session.temp)) {
+            verifyIdentity(session.temp, intent);
+        }
+        if (readStartTimestamp(intent.destination) != intent.startNs) {
+            throw new IOException("保存先の START 時刻が一致しません");
+        }
+        long csvStopNs = readStopTimestamp(intent.destination);
+        if (intent.complete && csvStopNs >= 0L && csvStopNs != intent.stopNs) {
+            throw new IOException("保存先の STOP 時刻が一致しません");
+        }
+        syncFile(intent.destination);
+        syncDirectory(root);
         session.saved = true;
         cleanup(session);
+        Log.i(TAG, "Saved CSV: " + intent.destination.getAbsolutePath()
+                + " bytes=" + intent.size + " startNs=" + intent.startNs
+                + " csvStopNs=" + csvStopNs + " complete=" + intent.complete);
+    }
+
+    private boolean exists(File file) {
+        return Files.exists(file.toPath(), LinkOption.NOFOLLOW_LINKS);
+    }
+
+    private StructStat statRegularFile(File file) throws IOException {
+        try {
+            StructStat stat = Os.lstat(file.getAbsolutePath());
+            if (!OsConstants.S_ISREG(stat.st_mode)) {
+                throw new IOException("通常ファイルではありません: " + file.getName());
+            }
+            return stat;
+        } catch (ErrnoException exception) {
+            throw new IOException("ファイル情報を確認できません: " + file.getName(), exception);
+        }
+    }
+
+    private void verifyIdentity(File file, SaveIntent intent) throws IOException {
+        StructStat stat = statRegularFile(file);
+        if (stat.st_dev != intent.device || stat.st_ino != intent.inode
+                || stat.st_size != intent.size) {
+            throw new IOException("保存対象とファイルの識別情報が一致しません: " + file.getName());
+        }
     }
 
     void discard(Session session) throws IOException {
+        if (exists(saveIntentFile(session))) {
+            SaveIntent intent = readSaveIntent(session);
+            if (!exists(session.temp)) {
+                // リネーム済みCSVをRESETで削除しない。同期を完了して後片付けする。
+                finishSave(session, intent);
+                return;
+            }
+            verifyIdentity(session.temp, intent);
+        }
         // SAVE の途中で保存名ができていた場合も、その CSV は残す。
         File linked = findLinkedCsv(session);
 
@@ -276,6 +456,8 @@ final class SessionFiles {
                 new File(marker(session).getPath() + ".new").toPath()
         );
 
+        Files.deleteIfExists(new File(saveIntentFile(session).getPath() + ".new").toPath());
+        Files.deleteIfExists(saveIntentFile(session).toPath());
         syncDirectory(root);
     }
 
@@ -312,12 +494,13 @@ final class SessionFiles {
     }
 
     private File findLinkedCsv(Session session) throws IOException {
-        if (!session.temp.exists()) {
+        if (!Files.isRegularFile(session.temp.toPath(), LinkOption.NOFOLLOW_LINKS)) {
             return null;
         }
 
         for (File file : listFiles(".csv")) {
             if (matchesCsvStem(file.getName(), session.stem)
+                    && Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)
                     && Files.isSameFile(
                     session.temp.toPath(),
                     file.toPath()
@@ -327,6 +510,29 @@ final class SessionFiles {
         }
 
         return null;
+    }
+
+    private long readStartTimestamp(File file) throws IOException {
+        try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+            if (!HEADER.equals(readLine(input, 64))) {
+                throw new IOException("CSV ヘッダーが不正です");
+            }
+            String[] start = readLine(input, 128).split(",", -1);
+            if (start.length != 6 || !"START".equals(start[1])
+                    || !start[2].isEmpty() || !start[3].isEmpty()
+                    || !start[4].isEmpty() || !start[5].isEmpty()) {
+                throw new IOException("START 行が不正です");
+            }
+            try {
+                long timestamp = Long.parseLong(start[0]);
+                if (timestamp < 0L) {
+                    throw new IOException("開始時刻が不正です");
+                }
+                return timestamp;
+            } catch (NumberFormatException exception) {
+                throw new IOException("開始時刻が不正です", exception);
+            }
+        }
     }
 
     private String readLine(
@@ -350,14 +556,52 @@ final class SessionFiles {
         }
     }
 
-    private boolean endsWithNewline(File file) throws IOException {
+    private long readStopTimestamp(File file) throws IOException {
+        // 全ファイルを読み込まず、末尾の1行だけを確認する。
         try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
-            if (input.length() == 0L) {
-                return false;
+            long length = input.length();
+            if (length == 0L) {
+                throw new IOException("CSV が空です");
             }
 
-            input.seek(input.length() - 1L);
-            return input.read() == '\n';
+            byte[] tail = new byte[(int) Math.min(length, 129L)];
+            input.seek(length - tail.length);
+            input.readFully(tail);
+            if (tail[tail.length - 1] != '\n') {
+                throw new IOException("CSV の末尾行が未完了です");
+            }
+
+            int begin = tail.length - 2;
+            while (begin >= 0 && tail[begin] != '\n') {
+                begin--;
+            }
+            if (begin < 0 && length > tail.length) {
+                throw new IOException("CSV の末尾行が長すぎます");
+            }
+            begin++;
+            String[] fields = new String(
+                    tail, begin, tail.length - begin - 1,
+                    StandardCharsets.US_ASCII
+            ).split(",", -1);
+
+            // 旧版の STOP 行がない記録は変更せず、従来のマーカーで復旧する。
+            if (fields.length < 2 || !"STOP".equals(fields[1])) {
+                return -1L;
+            }
+            if (fields.length != 6 || !fields[2].isEmpty()
+                    || !fields[3].isEmpty() || !fields[4].isEmpty()
+                    || !fields[5].isEmpty()) {
+                throw new IOException("STOP 行が不正です");
+            }
+            try {
+                long timestamp = Long.parseLong(fields[0]);
+                if (timestamp < 0L) {
+                    throw new IOException("STOP 時刻が不正です");
+                }
+                return timestamp;
+            } catch (NumberFormatException exception) {
+                throw new IOException("STOP 時刻が不正です", exception);
+            }
         }
     }
 
@@ -440,18 +684,29 @@ final class SessionFiles {
         File[] temporaryFiles = {
                 session.temp,
                 marker,
-                new File(marker.getPath() + ".new")
+                new File(marker.getPath() + ".new"),
+                new File(saveIntentFile(session).getPath() + ".new")
         };
 
+        boolean removed = true;
         for (File file : temporaryFiles) {
             try {
                 Files.deleteIfExists(file.toPath());
             } catch (IOException exception) {
+                removed = false;
                 Log.w(
                         TAG,
                         "保存後の一時ファイル削除を次回再試行します",
                         exception
                 );
+            }
+        }
+        // 他の一時ファイルが残った場合は、次回復旧用の管理情報を残す。
+        if (removed) {
+            try {
+                Files.deleteIfExists(saveIntentFile(session).toPath());
+            } catch (IOException exception) {
+                Log.w(TAG, "保存管理ファイルの削除を次回再試行します", exception);
             }
         }
     }

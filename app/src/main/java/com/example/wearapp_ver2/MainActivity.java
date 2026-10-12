@@ -26,7 +26,7 @@ import java.util.Locale;
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = "MainActivity";
-    private static final long DISPLAY_INTERVAL_MS = 50L;
+    private static final long DISPLAY_INTERVAL_MS = 1000L;
     private static final int NOTIFICATION_PERMISSION_REQUEST = 100;
 
     private TextView stopwatchText;
@@ -132,8 +132,10 @@ public class MainActivity extends AppCompatActivity {
         });
 
         stopButton.setOnClickListener(view -> {
+            long stopNs = SystemClock.elapsedRealtimeNanos();
+
             if (measurementService != null) {
-                measurementService.stopMeasurement();
+                measurementService.stopMeasurement(stopNs);
             }
         });
 
@@ -307,15 +309,13 @@ public class MainActivity extends AppCompatActivity {
 
         long minutes = totalMilliseconds / 60_000L;
         long seconds = (totalMilliseconds / 1_000L) % 60L;
-        long milliseconds = totalMilliseconds % 1_000L;
 
         stopwatchText.setText(
                 String.format(
                         Locale.ROOT,
-                        "%02d:%02d:%03d",
+                        "%02d:%02d",
                         minutes,
-                        seconds,
-                        milliseconds
+                        seconds
                 )
         );
     }

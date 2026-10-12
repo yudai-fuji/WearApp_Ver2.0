@@ -15,10 +15,11 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 final class SensorRecorder implements Runnable, SensorEventListener {
@@ -39,8 +40,14 @@ final class SensorRecorder implements Runnable, SensorEventListener {
     private static final String TAG = "SensorRecorder";
 
     private static final int QUEUE_CAPACITY = 2048;
+    private static final long NO_STOP_REQUEST = -2L;
+    private static final long INTERNAL_STOP = -1L;
     private static final long FLUSH_INTERVAL_MS = 1_000L;
     private static final long SYNC_INTERVAL_MS = 5_000L;
+
+    // 本番実験では false にする。停止時の最終集計は常に出力する。
+    private static final boolean PERIODIC_QUEUE_LOG_ENABLED = true;
+    private static final long QUEUE_LOG_INTERVAL_MS = 1_000L;
 
     private static final int[] SENSOR_TYPES = {
             Sensor.TYPE_LINEAR_ACCELERATION,
@@ -61,7 +68,8 @@ final class SensorRecorder implements Runnable, SensorEventListener {
     private final ArrayBlockingQueue<Sample> queue =
             new ArrayBlockingQueue<>(QUEUE_CAPACITY);
 
-    private final AtomicBoolean stopRequested = new AtomicBoolean();
+    // 要求の有無と操作時刻を一度の CAS で公開する。
+    private final AtomicLong stopRequestNs = new AtomicLong(NO_STOP_REQUEST);
 
     private final AtomicReference<String> failure =
             new AtomicReference<>();
@@ -74,6 +82,11 @@ final class SensorRecorder implements Runnable, SensorEventListener {
     private volatile Handler sensorHandler;
     private volatile boolean producerDone;
     private volatile long stopNs = -1L;
+
+    // 更新はセンサスレッドのみ。書き込みスレッドはログ出力のために読む。
+    private volatile int maxObservedQueueSize;
+    private volatile boolean queueOfferAttempted;
+    private volatile long queueFullCount;
 
     private HandlerThread sensorThread;
 
@@ -94,16 +107,27 @@ final class SensorRecorder implements Runnable, SensorEventListener {
         this.listener = listener;
     }
 
-    void requestStop() {
-        if (!stopRequested.compareAndSet(false, true)) {
-            return;
+    boolean requestStop(long requestedStopNs) {
+        if (requestedStopNs < startNs) {
+            throw new IllegalArgumentException("STOP 時刻が START より前です");
+        }
+        return requestStopAt(requestedStopNs);
+    }
+
+    private void requestStop() {
+        requestStopAt(INTERNAL_STOP);
+    }
+
+    private boolean requestStopAt(long requestedStopNs) {
+        if (!stopRequestNs.compareAndSet(NO_STOP_REQUEST, requestedStopNs)) {
+            return false;
         }
 
         Handler handler = sensorHandler;
-
         if (handler != null) {
             handler.post(this::finishCapture);
         }
+        return true;
     }
 
     void abort(String reason) {
@@ -143,6 +167,13 @@ final class SensorRecorder implements Runnable, SensorEventListener {
                     startSensorThread();
                     drainQueue(writer, output);
 
+                    // 操作 STOP だけを記録する。異常終了時刻で代用しない。
+                    long requestedStopNs = stopRequestNs.get();
+                    if (requestedStopNs >= 0L) {
+                        writer.write(Long.toString(requestedStopNs));
+                        writer.write(",STOP,,,,\n");
+                    }
+
                     writer.flush();
                     output.getFD().sync();
 
@@ -168,6 +199,7 @@ final class SensorRecorder implements Runnable, SensorEventListener {
             }
 
             awaitCaptureStopped();
+            logQueueStats("final");
 
             if (sensorThread != null) {
                 sensorThread.quitSafely();
@@ -197,6 +229,7 @@ final class SensorRecorder implements Runnable, SensorEventListener {
     ) throws IOException {
         long lastFlushMs = SystemClock.elapsedRealtime();
         long lastSyncMs = lastFlushMs;
+        long lastQueueLogMs = lastFlushMs;
 
         while (!producerDone || !queue.isEmpty()) {
             Sample sample;
@@ -226,7 +259,39 @@ final class SensorRecorder implements Runnable, SensorEventListener {
                 writer.flush();
                 lastFlushMs = nowMs;
             }
+
+            if (PERIODIC_QUEUE_LOG_ENABLED
+                    && nowMs - lastQueueLogMs >= QUEUE_LOG_INTERVAL_MS) {
+                logQueueStats("periodic");
+                lastQueueLogMs = SystemClock.elapsedRealtime();
+            }
         }
+    }
+
+    private void logQueueStats(String phase) {
+        int current = queue.size();
+        long fullCount = queueFullCount;
+        int observed = maxObservedQueueSize;
+        if (fullCount > 0L) {
+            observed = QUEUE_CAPACITY;
+        }
+        int upper = queueOfferAttempted
+                ? Math.min(QUEUE_CAPACITY, observed + 1)
+                : observed;
+
+        // 1 producer の offer 直前に観測するため、真の最大は observed..upper。
+        // current はログ時の瞬時値。I/O 待ち中は周期ログ自体も遅れる。
+        Log.i(TAG, String.format(
+                Locale.ROOT,
+                "Queue %s startNs=%d current=%d capacity=%d "
+                        + "maxObserved=%d maxUpper=%d "
+                        + "maxPctObserved=%.3f maxPctUpper=%.3f full=%d",
+                phase, startNs, current, QUEUE_CAPACITY,
+                observed, upper,
+                observed * 100.0 / QUEUE_CAPACITY,
+                upper * 100.0 / QUEUE_CAPACITY,
+                fullCount
+        ));
     }
 
     private void startSensorThread() {
@@ -242,13 +307,13 @@ final class SensorRecorder implements Runnable, SensorEventListener {
         sensorHandler = handler;
 
         // Handler を公開する前に要求された STOP も処理する。
-        if (stopRequested.get()) {
+        if (stopRequestNs.get() != NO_STOP_REQUEST) {
             handler.post(this::finishCapture);
         }
     }
 
     private void registerSensors(Handler handler) {
-        if (stopRequested.get()) {
+        if (stopRequestNs.get() != NO_STOP_REQUEST) {
             finishCapture();
             return;
         }
@@ -278,7 +343,7 @@ final class SensorRecorder implements Runnable, SensorEventListener {
                 }
             }
 
-            if (stopRequested.get()) {
+            if (stopRequestNs.get() != NO_STOP_REQUEST) {
                 finishCapture();
                 return;
             }
@@ -362,7 +427,18 @@ final class SensorRecorder implements Runnable, SensorEventListener {
                 );
             }
 
+            // offer 後だけの size() では、消費との競合でピークを見逃す。
+            int sizeBeforeOffer = queue.size();
+            if (sizeBeforeOffer > maxObservedQueueSize) {
+                maxObservedQueueSize = sizeBeforeOffer;
+            }
+            if (!queueOfferAttempted) {
+                queueOfferAttempted = true;
+            }
+
             if (!queue.offer(sample)) {
+                maxObservedQueueSize = QUEUE_CAPACITY;
+                queueFullCount++;
                 fail("書き込みキューが満杯になったため停止しました", null);
                 finishCapture();
             }
@@ -383,10 +459,14 @@ final class SensorRecorder implements Runnable, SensorEventListener {
             return;
         }
 
-        stopNs = SystemClock.elapsedRealtimeNanos();
+        stopRequestNs.compareAndSet(NO_STOP_REQUEST, INTERNAL_STOP);
+        long requestedStopNs = stopRequestNs.get();
+        // 操作時刻と内部終了時刻を区別し、操作時刻を上書きしない。
+        stopNs = requestedStopNs >= 0L
+                ? requestedStopNs
+                : SystemClock.elapsedRealtimeNanos();
 
         accepting = false;
-        stopRequested.set(true);
 
         try {
             sensorManager.unregisterListener(this);

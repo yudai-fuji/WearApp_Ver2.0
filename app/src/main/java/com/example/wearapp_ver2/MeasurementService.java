@@ -257,14 +257,17 @@ public class MeasurementService extends Service
         notifyStateChanged();
     }
 
-    public void stopMeasurement() {
+    public void stopMeasurement(long requestedStopNs) {
         if (destroyed
                 || (state != State.STARTING && state != State.RUNNING)) {
             return;
         }
 
+        if (recorder.requestStop(requestedStopNs)) {
+            // 終了処理を待たず、操作を受け付けた時刻で表示を止める。
+            stopNs = requestedStopNs;
+        }
         state = State.STOPPING;
-        recorder.requestStop();
 
         notifyStateChanged();
     }
